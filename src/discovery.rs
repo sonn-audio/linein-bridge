@@ -16,7 +16,7 @@ pub fn discover_server(
     preferred_name: Option<&str>,
     preferred_mac: Option<&str>,
 ) -> Result<DiscoveredServer> {
-    const SERVICE_TYPE: &str = "_loxaudio._tcp.local.";
+    const SERVICE_TYPE: &str = "_sonncore._tcp.local.";
     let mdns = ServiceDaemon::new().context("start mDNS daemon")?;
     let receiver = mdns.browse(SERVICE_TYPE).context("browse mDNS services")?;
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -62,7 +62,7 @@ pub fn discover_server(
 
     if candidates.is_empty() {
         shutdown_mdns(&mdns, SERVICE_TYPE);
-        anyhow::bail!("no _loxaudio._tcp services found");
+        anyhow::bail!("no _sonncore._tcp services found");
     }
 
     if candidates.len() == 1 {
