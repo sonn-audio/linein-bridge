@@ -204,10 +204,14 @@ async fn stream_audio_tcp(params: &mut StreamParams) -> Result<()> {
     let max_pending = max_buffer_bytes_for_rate(params.output_rate);
     let mut pending = VecDeque::with_capacity(max_pending);
     let mut overrun_since = Instant::now();
+    let mut overrun_bytes: u64 = 0;
     let mut underrun_since = Instant::now();
     let mut underrun_bytes: u64 = 0;
     let mut tick = tokio::time::interval(chunk_interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip, not Delay: Delay pushes the deadline forward on every late tick, so the writer's
+    // schedule drifts permanently behind the capture side and the backlog only ever grows. Skip
+    // keeps the original cadence and lets the catch-up drain above absorb the lost tick instead.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut stream: Option<TcpStream> = None;
     loop {
@@ -235,14 +239,15 @@ async fn stream_audio_tcp(params: &mut StreamParams) -> Result<()> {
                         let rms_db = rms_db_from_pcm_i16_le(&chunk);
                         pending.extend(chunk);
                         if pending.len() > max_pending {
+                            // Oldest-first, so the discontinuity lands as far back as possible.
+                            // Accumulated rather than logged per event: the old code reported the
+                            // size of one drop on a 5s throttle, which reads like a periodic 4800-byte
+                            // loss and hides how much actually went missing.
                             let overflow = pending.len() - max_pending;
                             for _ in 0..overflow {
                                 pending.pop_front();
                             }
-                            if overrun_since.elapsed() >= Duration::from_secs(5) {
-                                warn!("audio buffer overrun, dropping {} bytes", overflow);
-                                overrun_since = Instant::now();
-                            }
+                            overrun_bytes += overflow as u64;
                         }
                         params.status.set_rms_db(rms_db);
                         if let Some(rms_db) = rms_db {
@@ -290,35 +295,27 @@ async fn stream_audio_tcp(params: &mut StreamParams) -> Result<()> {
                 }
                 if let Some(writer) = stream.as_mut() {
                     if pending.len() < chunk_bytes {
-                        let missing = chunk_bytes - pending.len();
-                        let mut payload = Vec::with_capacity(chunk_bytes);
-                        while let Some(value) = pending.pop_front() {
-                            payload.push(value);
-                        }
-                        payload.extend(std::iter::repeat_n(0u8, missing));
-                        underrun_bytes += missing as u64;
-                        if let Err(err) = writer.write_all(&payload).await {
-                            params.status.set_last_error(Some(err.to_string()));
-                            stream = None;
-                        } else {
-                            params.status.set_state("STREAMING");
-                            params.status.record_bytes(chunk_bytes);
-                            bytes_since_log += chunk_bytes as u64;
-                        }
+                        // Nothing whole to send yet. Waiting one more tick keeps the samples we do
+                        // have intact; padding with silence would splice a gap into the audio and
+                        // then *also* push the stream ahead of the source, which is the drift we are
+                        // trying not to invent.
+                        underrun_bytes += (chunk_bytes - pending.len()) as u64;
                     } else {
-                        let mut payload = Vec::with_capacity(chunk_bytes);
-                        for _ in 0..chunk_bytes {
+                        let send_bytes = drain_bytes_for_tick(pending.len(), chunk_bytes);
+                        let mut payload = Vec::with_capacity(send_bytes);
+                        for _ in 0..send_bytes {
                             if let Some(value) = pending.pop_front() {
                                 payload.push(value);
                             }
                         }
+                        let sent = payload.len();
                         if let Err(err) = writer.write_all(&payload).await {
                             params.status.set_last_error(Some(err.to_string()));
                             stream = None;
                         } else {
                             params.status.set_state("STREAMING");
-                            params.status.record_bytes(chunk_bytes);
-                            bytes_since_log += chunk_bytes as u64;
+                            params.status.record_bytes(sent);
+                            bytes_since_log += sent as u64;
                         }
                     }
                     if last_rate_log.elapsed() >= Duration::from_secs(5) {
@@ -332,9 +329,18 @@ async fn stream_audio_tcp(params: &mut StreamParams) -> Result<()> {
                         bytes_since_log = 0;
                         last_rate_log = Instant::now();
                     }
+                    if overrun_since.elapsed() >= Duration::from_secs(5) && overrun_bytes > 0 {
+                        warn!(
+                            "audio buffer overrun: {} bytes dropped in last {:.1}s",
+                            overrun_bytes,
+                            overrun_since.elapsed().as_secs_f64()
+                        );
+                        overrun_bytes = 0;
+                        overrun_since = Instant::now();
+                    }
                     if underrun_since.elapsed() >= Duration::from_secs(5) && underrun_bytes > 0 {
                         warn!(
-                            "audio buffer underrun: {} bytes padded in last {:.1}s",
+                            "audio buffer short by {} bytes in last {:.1}s (waited, did not pad)",
                             underrun_bytes,
                             underrun_since.elapsed().as_secs_f64()
                         );
@@ -384,10 +390,14 @@ async fn stream_audio_ws(params: &mut StreamParams) -> Result<()> {
     let max_pending = max_buffer_bytes_for_rate(params.output_rate);
     let mut pending = VecDeque::with_capacity(max_pending);
     let mut overrun_since = Instant::now();
+    let mut overrun_bytes: u64 = 0;
     let mut underrun_since = Instant::now();
     let mut underrun_bytes: u64 = 0;
     let mut tick = tokio::time::interval(chunk_interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip, not Delay: Delay pushes the deadline forward on every late tick, so the writer's
+    // schedule drifts permanently behind the capture side and the backlog only ever grows. Skip
+    // keeps the original cadence and lets the catch-up drain above absorb the lost tick instead.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut stream = None;
     loop {
@@ -415,14 +425,15 @@ async fn stream_audio_ws(params: &mut StreamParams) -> Result<()> {
                         let rms_db = rms_db_from_pcm_i16_le(&chunk);
                         pending.extend(chunk);
                         if pending.len() > max_pending {
+                            // Oldest-first, so the discontinuity lands as far back as possible.
+                            // Accumulated rather than logged per event: the old code reported the
+                            // size of one drop on a 5s throttle, which reads like a periodic 4800-byte
+                            // loss and hides how much actually went missing.
                             let overflow = pending.len() - max_pending;
                             for _ in 0..overflow {
                                 pending.pop_front();
                             }
-                            if overrun_since.elapsed() >= Duration::from_secs(5) {
-                                warn!("audio buffer overrun, dropping {} bytes", overflow);
-                                overrun_since = Instant::now();
-                            }
+                            overrun_bytes += overflow as u64;
                         }
                         params.status.set_rms_db(rms_db);
                         if let Some(rms_db) = rms_db {
@@ -469,31 +480,27 @@ async fn stream_audio_ws(params: &mut StreamParams) -> Result<()> {
                     continue;
                 }
                 if let Some(writer) = stream.as_mut() {
-                    let payload = if pending.len() < chunk_bytes {
-                        let missing = chunk_bytes - pending.len();
-                        let mut buffer = Vec::with_capacity(chunk_bytes);
-                        while let Some(value) = pending.pop_front() {
-                            buffer.push(value);
-                        }
-                        buffer.extend(std::iter::repeat_n(0u8, missing));
-                        underrun_bytes += missing as u64;
-                        buffer
+                    if pending.len() < chunk_bytes {
+                        // Wait rather than pad: see the TCP writer for why silence is worse than
+                        // arriving a tick late.
+                        underrun_bytes += (chunk_bytes - pending.len()) as u64;
                     } else {
-                        let mut buffer = Vec::with_capacity(chunk_bytes);
-                        for _ in 0..chunk_bytes {
+                        let send_bytes = drain_bytes_for_tick(pending.len(), chunk_bytes);
+                        let mut buffer = Vec::with_capacity(send_bytes);
+                        for _ in 0..send_bytes {
                             if let Some(value) = pending.pop_front() {
                                 buffer.push(value);
                             }
                         }
-                        buffer
-                    };
-                    if let Err(err) = writer.send(Message::Binary(payload)).await {
-                        params.status.set_last_error(Some(err.to_string()));
-                        stream = None;
-                    } else {
-                        params.status.set_state("STREAMING");
-                        params.status.record_bytes(chunk_bytes);
-                        bytes_since_log += chunk_bytes as u64;
+                        let sent = buffer.len();
+                        if let Err(err) = writer.send(Message::Binary(buffer)).await {
+                            params.status.set_last_error(Some(err.to_string()));
+                            stream = None;
+                        } else {
+                            params.status.set_state("STREAMING");
+                            params.status.record_bytes(sent);
+                            bytes_since_log += sent as u64;
+                        }
                     }
                     if last_rate_log.elapsed() >= Duration::from_secs(5) {
                         let secs = last_rate_log.elapsed().as_secs_f64();
@@ -506,9 +513,18 @@ async fn stream_audio_ws(params: &mut StreamParams) -> Result<()> {
                         bytes_since_log = 0;
                         last_rate_log = Instant::now();
                     }
+                    if overrun_since.elapsed() >= Duration::from_secs(5) && overrun_bytes > 0 {
+                        warn!(
+                            "audio buffer overrun: {} bytes dropped in last {:.1}s",
+                            overrun_bytes,
+                            overrun_since.elapsed().as_secs_f64()
+                        );
+                        overrun_bytes = 0;
+                        overrun_since = Instant::now();
+                    }
                     if underrun_since.elapsed() >= Duration::from_secs(5) && underrun_bytes > 0 {
                         warn!(
-                            "audio buffer underrun: {} bytes padded in last {:.1}s",
+                            "audio buffer short by {} bytes in last {:.1}s (waited, did not pad)",
                             underrun_bytes,
                             underrun_since.elapsed().as_secs_f64()
                         );
@@ -649,4 +665,69 @@ fn chunk_interval() -> Duration {
 fn max_buffer_bytes_for_rate(rate: u32) -> usize {
     let buffer_seconds = 2u32;
     rate.saturating_mul(4).saturating_mul(buffer_seconds) as usize
+}
+
+/// Bytes to send on one tick, given what is queued.
+///
+/// The writer wakes on a fixed interval and used to send exactly one chunk, which makes it an
+/// open-loop consumer: with MissedTickBehavior::Delay a late tick moves the deadline forward for
+/// good, so every scheduling hiccup and every blocking write costs airtime that is never won back.
+/// The capture side meanwhile runs at the card's rate, so the shortfall accumulates until the buffer
+/// saturates and audio is discarded -- which no clock correction can fix, because it is not drift.
+///
+/// So drain the backlog instead of a fixed slice, capped so a long stall cannot dump seconds of
+/// audio into the socket at once. The receiver is a plain stream with no rate expectation, so
+/// sending early is harmless; sending too little forever is not.
+fn drain_bytes_for_tick(pending_len: usize, chunk_bytes: usize) -> usize {
+    const MAX_CHUNKS_PER_TICK: usize = 4;
+    let whole_chunks = pending_len / chunk_bytes;
+    whole_chunks.clamp(1, MAX_CHUNKS_PER_TICK) * chunk_bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: usize = 7680; // 40 ms of s16le stereo at 48 kHz
+
+    #[test]
+    fn a_backlog_is_drained_faster_than_it_arrives() {
+        // The bug: the writer sent exactly one chunk per tick regardless of the backlog, so it could
+        // never win back time lost to a late tick or a blocking write. The capture side keeps
+        // producing at the card's rate, so the deficit accumulated until the buffer overflowed --
+        // which reads like clock drift but is not, and no rate correction fixes it.
+        assert_eq!(drain_bytes_for_tick(CHUNK * 3, CHUNK), CHUNK * 3);
+        assert_eq!(drain_bytes_for_tick(CHUNK * 2, CHUNK), CHUNK * 2);
+    }
+
+    #[test]
+    fn catch_up_is_capped_so_a_long_stall_does_not_dump_the_buffer() {
+        // A 2 second backlog must not land on the socket in one write.
+        assert_eq!(drain_bytes_for_tick(CHUNK * 50, CHUNK), CHUNK * 4);
+    }
+
+    #[test]
+    fn steady_state_sends_exactly_one_chunk() {
+        assert_eq!(drain_bytes_for_tick(CHUNK, CHUNK), CHUNK);
+        // A partial chunk on top of a whole one is left for the next tick: only whole chunks go out,
+        // so the stream never carries a half frame.
+        assert_eq!(drain_bytes_for_tick(CHUNK + 100, CHUNK), CHUNK);
+    }
+
+    #[test]
+    fn never_asks_for_more_than_is_queued() {
+        // Callers only reach this with at least one whole chunk buffered, but the clamp floor must
+        // not invent bytes if that ever changes.
+        for len in [0usize, 1, CHUNK - 1] {
+            assert_eq!(drain_bytes_for_tick(len, CHUNK), CHUNK);
+        }
+    }
+
+    #[test]
+    fn buffer_is_two_seconds_not_one_period() {
+        // Pins the sizing that ruled out "the buffer is one period too tight": 4800 dropped bytes is
+        // 1.25% of this, so a shortfall that small cannot be what overflows it.
+        assert_eq!(max_buffer_bytes_for_rate(48_000), 48_000 * 4 * 2);
+        assert_eq!(chunk_bytes_for_rate(48_000), CHUNK);
+    }
 }
