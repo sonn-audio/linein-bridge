@@ -1,3 +1,10 @@
+## [1.10.1](https://github.com/sonn-audio/linein-bridge/compare/v1.10.0...v1.10.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* pick the right server when several audioservers advertise ([39ed9df](https://github.com/sonn-audio/linein-bridge/commit/39ed9dfd00d000defe2a0673f49ff1506a33ece9))
+
 # [1.10.0](https://github.com/sonn-audio/linein-bridge/compare/v1.9.1...v1.10.0) (2026-07-27)
 
 
