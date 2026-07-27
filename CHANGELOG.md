@@ -1,3 +1,24 @@
+# [2.0.0](https://github.com/sonn-audio/linein-bridge/compare/v1.10.1...v2.0.0) (2026-07-27)
+
+
+* feat!: replace on_start/on_stop with a single on_command hook ([9583ff5](https://github.com/sonn-audio/linein-bridge/commit/9583ff52bc59b91439080cfc15b1470db48de8ed))
+
+
+### Bug Fixes
+
+* let the writer catch up instead of dropping audio ([555aecf](https://github.com/sonn-audio/linein-bridge/commit/555aecf4f3987c03cfec2dc456ec6a61c481085a))
+
+
+### BREAKING CHANGES
+
+* on_start and on_stop are no longer read. Replace them with a
+single on_command script that switches on `$1` -- start and stop are passed as
+commands where the old hooks fired.
+
+The script text is left exactly as configured rather than having "$@" appended to
+it, so a hook that already refers to its arguments does not silently receive them
+twice.
+
 ## [1.10.1](https://github.com/sonn-audio/linein-bridge/compare/v1.10.0...v1.10.1) (2026-07-27)
 
 
