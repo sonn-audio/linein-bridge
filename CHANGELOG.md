@@ -1,3 +1,10 @@
+# [2.1.0](https://github.com/sonn-audio/linein-bridge/compare/v2.0.0...v2.1.0) (2026-07-27)
+
+
+### Features
+
+* push commands over the ingest socket and cut audio latency ([4a142e2](https://github.com/sonn-audio/linein-bridge/commit/4a142e287f029d9c128c00d84f19c8f3849c0743))
+
 # [2.0.0](https://github.com/sonn-audio/linein-bridge/compare/v1.10.1...v2.0.0) (2026-07-27)
 
 
