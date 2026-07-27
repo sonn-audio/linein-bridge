@@ -52,7 +52,11 @@ mDNS discovery looks for `_sonncore._tcp` and uses TXT fields:
 
 ## Audio ingest protocol
 
-The bridge streams raw PCM over TCP:
+The bridge prefers the WebSocket ingest when the server offers `ingest_ws_url`, because that socket is
+bidirectional: binary frames carry audio upstream, text frames carry commands back down. It falls back
+to raw TCP otherwise.
+
+Over TCP the bridge streams raw PCM:
 - Connect to `ingest_tcp_host:ingest_tcp_port`
 - First line: `<assigned_input_id>\n`
 - Then continuous raw PCM `s16le`, `48 kHz`, `2 channels` (rate and resampler can be overridden by server)
@@ -129,8 +133,11 @@ is on -- so the bridge keeps no state of its own and simply forwards what it is 
 never heard of are passed through unchanged, so the server can add to the vocabulary without a bridge
 release.
 
-Commands ride along on the status poll, so expect up to 5 seconds of delay, plus however long the
-device itself needs. A hook that fails is logged and ignored; it never takes the audio stream down.
+Commands travel down the ingest WebSocket, so they arrive in a round trip -- about 10ms on a LAN.
+When the bridge is on the plain TCP ingest, or is momentarily reconnecting, the server falls back to
+queueing them on the status poll and they arrive within the poll interval instead. Either way the
+device's own start-up time is on top. A hook that fails is logged and ignored; it never takes the
+audio stream down.
 
 ## Systemd unit
 

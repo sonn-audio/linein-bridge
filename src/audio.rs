@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{HostId, SampleFormat, StreamConfig};
+use cpal::{BufferSize, HostId, SampleFormat, StreamConfig, SupportedBufferSize};
 use rubato::{
     Resampler as RubatoResampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+/// Capture period we ask ALSA for. Short enough to keep a live source responsive, long enough that
+/// a busy Pi is not woken thousands of times a second.
+const CAPTURE_PERIOD_MS: u32 = 10;
 
 pub const TARGET_CHANNELS: u16 = 2;
 
@@ -113,7 +117,14 @@ pub fn start_capture(
             .context("read default input config")?,
     };
     let sample_format = supported.sample_format();
-    let config: StreamConfig = supported.into();
+    let buffer_range = *supported.buffer_size();
+    let mut config: StreamConfig = supported.into();
+    // Ask for a short capture period instead of letting the driver choose. Left to itself ALSA hands
+    // out a large one (1200 frames, 25ms, measured on a HiFiBerry), and every frame of that is delay
+    // between the instrument and the speaker on a live source. Clamped to what the device actually
+    // supports, and left at the driver's choice when it advertises no range -- an unsupported value
+    // makes the stream fail to build rather than degrade.
+    config.buffer_size = resolve_capture_buffer_size(&buffer_range, config.sample_rate.0);
 
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (err_tx, err_rx) = mpsc::channel::<String>(4);
@@ -249,6 +260,19 @@ fn map_channels(frame: &[f32], channels: u16) -> (f32, f32) {
         0 => (0.0, 0.0),
         1 => (frame[0], frame[0]),
         _ => (frame[0], frame[1]),
+    }
+}
+
+/// Capture period to request, in frames, clamped to the device's advertised range.
+///
+/// Target is CAPTURE_PERIOD_MS worth of frames. Returning Default when the device advertises no
+/// range is deliberate: a Fixed value the driver rejects makes building the stream fail outright,
+/// which is worse than the latency it saves.
+fn resolve_capture_buffer_size(range: &SupportedBufferSize, rate: u32) -> BufferSize {
+    let target = (rate.saturating_mul(CAPTURE_PERIOD_MS) / 1000).max(64);
+    match range {
+        SupportedBufferSize::Range { min, max } => BufferSize::Fixed(target.clamp(*min, *max)),
+        SupportedBufferSize::Unknown => BufferSize::Default,
     }
 }
 
@@ -628,4 +652,61 @@ fn interleave_to_i16(output: &[Vec<f32>]) -> Vec<i16> {
         out.push(f32_to_i16(right[idx]));
     }
     out
+}
+
+#[cfg(test)]
+mod capture_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn asks_for_a_short_period_within_the_device_range() {
+        // 10ms at 48kHz is 480 frames, well inside a typical range.
+        let range = SupportedBufferSize::Range { min: 64, max: 4096 };
+        assert!(matches!(
+            resolve_capture_buffer_size(&range, 48_000),
+            BufferSize::Fixed(480)
+        ));
+    }
+
+    #[test]
+    fn clamps_to_what_the_device_supports() {
+        // A device with a high floor gets its floor, not a value it would reject: an unsupported
+        // Fixed size makes build_input_stream fail rather than fall back.
+        let range = SupportedBufferSize::Range {
+            min: 1024,
+            max: 4096,
+        };
+        assert!(matches!(
+            resolve_capture_buffer_size(&range, 48_000),
+            BufferSize::Fixed(1024)
+        ));
+        let tight = SupportedBufferSize::Range { min: 64, max: 256 };
+        assert!(matches!(
+            resolve_capture_buffer_size(&tight, 48_000),
+            BufferSize::Fixed(256)
+        ));
+    }
+
+    #[test]
+    fn leaves_the_driver_alone_when_it_advertises_no_range() {
+        assert!(matches!(
+            resolve_capture_buffer_size(&SupportedBufferSize::Unknown, 48_000),
+            BufferSize::Default
+        ));
+    }
+
+    #[test]
+    fn never_asks_for_an_absurdly_small_period() {
+        // A very low rate must not round down to a handful of frames.
+        let range = SupportedBufferSize::Range { min: 1, max: 4096 };
+        assert!(matches!(
+            resolve_capture_buffer_size(&range, 8_000),
+            BufferSize::Fixed(80)
+        ));
+        let range = SupportedBufferSize::Range { min: 1, max: 4096 };
+        assert!(matches!(
+            resolve_capture_buffer_size(&range, 1_000),
+            BufferSize::Fixed(64)
+        ));
+    }
 }

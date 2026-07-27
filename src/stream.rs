@@ -1,6 +1,6 @@
 use crate::models::BridgeStatusRequest;
 use anyhow::{Context, Result};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -177,6 +177,10 @@ pub struct StreamParams {
     pub vad_updates: Option<tokio::sync::watch::Receiver<(f32, Duration)>>,
     pub status: StatusHandle,
     pub output_rate: u32,
+    /// Where commands pushed down the ingest socket are handed off. The WebSocket transport carries
+    /// them as text frames alongside the binary audio, so control arrives in milliseconds instead of
+    /// waiting for the next status poll. Absent for the TCP transport, which is upstream-only.
+    pub commands: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 pub async fn stream_audio(mut params: StreamParams) -> Result<()> {
@@ -419,6 +423,22 @@ async fn stream_audio_ws(params: &mut StreamParams) -> Result<()> {
         }
 
         tokio::select! {
+            // Commands arrive as text frames on the same socket that carries the audio, so a button
+            // press reaches the hardware in a round trip rather than on the next 5s poll.
+            incoming = read_ws_frame(stream.as_mut()) => {
+                match incoming {
+                    Some(Ok(text)) => {
+                        if let Some(hooks) = params.commands.as_ref() {
+                            dispatch_command_frame(hooks, &text).await;
+                        }
+                    }
+                    Some(Err(err)) => {
+                        params.status.set_last_error(Some(err.to_string()));
+                        stream = None;
+                    }
+                    None => {}
+                }
+            }
             maybe_chunk = params.rx.recv() => {
                 match maybe_chunk {
                     Some(chunk) => {
@@ -570,6 +590,53 @@ async fn connect_tcp(addr: &str, header: &str) -> Result<TcpStream> {
     Ok(stream)
 }
 
+/// Await one text frame from the ingest socket.
+///
+/// Resolves to `None` when there is no socket or the frame was not a command, which parks this arm of
+/// the select without busy-looping: `tokio::select!` re-polls the others, and a disconnected socket is
+/// handled by the reconnect at the top of the loop. Binary frames are not expected downstream (the
+/// audio flows the other way) and ping/pong is handled inside tungstenite.
+async fn read_ws_frame(stream: Option<&mut WsStream>) -> Option<Result<String>> {
+    let stream = match stream {
+        Some(stream) => stream,
+        // No socket yet: yield so the reconnect arm can make progress instead of spinning.
+        None => {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return None;
+        }
+    };
+    match stream.next().await {
+        Some(Ok(Message::Text(text))) => Some(Ok(text)),
+        Some(Ok(Message::Close(_))) => Some(Err(anyhow::anyhow!("ingest socket closed by server"))),
+        Some(Ok(_)) => None,
+        Some(Err(err)) => Some(Err(anyhow::Error::new(err))),
+        None => Some(Err(anyhow::anyhow!("ingest socket ended"))),
+    }
+}
+
+/// Hand a command frame to the hook.
+///
+/// Wire form is JSON, `{"command":"next","args":[]}`, with a bare string accepted as shorthand. The
+/// vocabulary is deliberately not validated here: the server owns it, so a command this build has
+/// never seen still reaches the script.
+async fn dispatch_command_frame(hooks: &crate::hooks::HookRunner, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match serde_json::from_str::<crate::models::SourceCommand>(trimmed) {
+        Ok(parsed) => hooks.command(&parsed.command, &parsed.args).await,
+        Err(_) => {
+            // Not JSON: treat the whole frame as the command name.
+            if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+                hooks.command(trimmed, &[]).await;
+            } else {
+                warn!("ignoring malformed command frame: {}", trimmed);
+            }
+        }
+    }
+}
+
 async fn connect_ws(url: &str) -> Result<WsStream> {
     let (stream, _) = connect_async(url)
         .await
@@ -651,15 +718,21 @@ fn rms_db_from_pcm_i16_le(bytes: &[u8]) -> Option<f32> {
     Some(db as f32)
 }
 
+/// How much audio goes out per write, and therefore the floor on how late it can be.
+///
+/// A line-in is a live source: everything buffered anywhere on this path is delay between the
+/// instrument and the speaker, with no benefit. 10ms is small enough to be inaudible on its own and
+/// still several hundred frames per write, so the syscall cost stays irrelevant.
+const CHUNK_MS: u32 = 10;
+
 fn chunk_bytes_for_rate(rate: u32) -> usize {
-    let chunk_ms = 40u32;
     let bytes_per_sec = rate.saturating_mul(4);
-    let bytes = bytes_per_sec.saturating_mul(chunk_ms) / 1000;
+    let bytes = bytes_per_sec.saturating_mul(CHUNK_MS) / 1000;
     bytes.max(4) as usize
 }
 
 fn chunk_interval() -> Duration {
-    Duration::from_millis(40)
+    Duration::from_millis(CHUNK_MS as u64)
 }
 
 fn max_buffer_bytes_for_rate(rate: u32) -> usize {
@@ -688,7 +761,7 @@ fn drain_bytes_for_tick(pending_len: usize, chunk_bytes: usize) -> usize {
 mod tests {
     use super::*;
 
-    const CHUNK: usize = 7680; // 40 ms of s16le stereo at 48 kHz
+    const CHUNK: usize = 1920; // 10 ms of s16le stereo at 48 kHz
 
     #[test]
     fn a_backlog_is_drained_faster_than_it_arrives() {
@@ -729,5 +802,6 @@ mod tests {
         // 1.25% of this, so a shortfall that small cannot be what overflows it.
         assert_eq!(max_buffer_bytes_for_rate(48_000), 48_000 * 4 * 2);
         assert_eq!(chunk_bytes_for_rate(48_000), CHUNK);
+        assert_eq!(chunk_interval(), Duration::from_millis(CHUNK_MS as u64));
     }
 }

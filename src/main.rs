@@ -289,6 +289,7 @@ async fn run() -> Result<()> {
                         vad_updates: Some(vad_rx.clone()),
                         status: status.clone(),
                         output_rate: current.target_rate,
+                        commands: Some(Arc::clone(&hooks)),
                     };
 
                     let current_key = current.stream_key();
