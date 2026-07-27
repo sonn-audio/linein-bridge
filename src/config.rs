@@ -15,6 +15,14 @@ pub struct Config {
     pub preferred_server_name: Option<String>,
     #[serde(default)]
     pub preferred_server_mac: Option<String>,
+    /// Run when the server reports this input has been selected. Use it to switch on gear that
+    /// does not power up by itself -- without it the chain deadlocks, because the VAD waits for
+    /// audio that only appears once the source is on.
+    #[serde(default)]
+    pub on_start: Option<String>,
+    /// Run when the input is deselected, and on shutdown if the source was still active.
+    #[serde(default)]
+    pub on_stop: Option<String>,
 }
 
 pub fn preferred_config_path() -> PathBuf {
@@ -65,6 +73,8 @@ pub fn load_or_create_config() -> Result<(Config, PathBuf)> {
         bridge_id: uuid::Uuid::new_v4().to_string(),
         preferred_server_name: None,
         preferred_server_mac: None,
+        on_start: None,
+        on_stop: None,
     };
     let path = write_config(&config)?;
     Ok((config, path))

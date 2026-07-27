@@ -45,7 +45,7 @@ lox-linein-bridge --log-level info
 
 Log levels: `off` (default), `error`, `warn`, `info`, `debug`, `trace`.
 
-mDNS discovery looks for `_loxaudio._tcp` and uses TXT fields:
+mDNS discovery looks for `_sonncore._tcp` and uses TXT fields:
 - `api` (default `/api`)
 - `linein_register` (default `/api/linein/bridges/register`)
 - `linein_status` (default `/api/linein/bridges/{bridge_id}/status`)
@@ -95,6 +95,28 @@ Config fields:
 - `bridge_id` (auto-generated if missing)
 - `preferred_server_name` (optional mDNS TXT match)
 - `preferred_server_mac` (optional mDNS TXT match)
+- `on_start` (optional command, run when the input is selected)
+- `on_stop` (optional command, run when it is deselected)
+
+## Switching the source on (hooks)
+
+The VAD only streams once there is audio, so a source that has to be switched on manually never
+starts by itself: nothing produces audio until it is on, and it is never turned on because nothing
+asked for it. The `on_start` / `on_stop` hooks close that loop.
+
+```toml
+on_start = "/home/rudy/code/scripts/power_on.sh"
+on_stop  = "/home/rudy/code/scripts/power_off.sh"
+```
+
+The server reports desired state as `source_active` on the status poll, so a hook runs on a
+*change* only -- not on every poll. Selecting the input in any client (the app, a remote, a scene)
+runs `on_start`; deselecting it, switching the zone to another source, or turning the zone off runs
+`on_stop`. Stopping the service runs `on_stop` too, if the source was still active.
+
+Commands go through `sh -c`, so arguments are fine. A hook that fails is logged and ignored; it
+never takes the audio stream down. Because the poll interval is 5 seconds, expect up to that much
+delay between selecting the input and the hook running, plus however long the device itself needs.
 
 ## Systemd unit
 

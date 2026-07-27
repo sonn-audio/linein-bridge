@@ -37,6 +37,11 @@ pub struct BridgeStatusRequest {
 #[derive(Debug, Deserialize, Clone)]
 pub struct BridgeConfigResponse {
     pub assigned_input_id: Option<String>,
+    /// Whether the server currently wants this source on. Drives the on_start/on_stop hooks.
+    /// Absent on servers that predate the field, which reads as "not selected" and leaves hooks
+    /// unused rather than firing spuriously.
+    #[serde(default)]
+    pub source_active: Option<bool>,
     pub ingest_ws_url: Option<String>,
     pub ingest_tcp_host: Option<String>,
     pub ingest_tcp_port: Option<u16>,

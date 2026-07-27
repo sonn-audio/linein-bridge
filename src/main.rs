@@ -3,6 +3,7 @@ mod audio;
 mod config;
 mod discovery;
 mod health;
+mod hooks;
 mod install;
 mod models;
 mod server_api;
@@ -10,6 +11,7 @@ mod stream;
 mod timestamp;
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -41,6 +43,34 @@ async fn main() -> Result<()> {
     }
 }
 
+/// `run()` never returns on its own, so systemd stopping us is the normal way this process ends.
+/// Catch that and run on_stop first, otherwise a source switched on by on_start stays on after the
+/// bridge is gone.
+fn spawn_shutdown_hooks(hooks: Arc<hooks::HookRunner>) {
+    tokio::spawn(async move {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(err) => {
+                    warn!("cannot listen for SIGTERM: {}", err);
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = term.recv() => info!("SIGTERM received"),
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    warn!("cannot listen for SIGINT: {}", err);
+                    return;
+                }
+                info!("SIGINT received");
+            }
+        }
+        hooks.shutdown().await;
+        std::process::exit(0);
+    });
+}
+
 async fn run() -> Result<()> {
     let (config, path) = config::load_or_create_config()?;
     info!("loaded config from {}", path.display());
@@ -49,6 +79,16 @@ async fn run() -> Result<()> {
         .to_string_lossy()
         .to_string();
     let (ip, mac) = local_identity()?;
+
+    // Shared across re-discovery so a server reconnect does not re-fire on_start for a source
+    // that is already on.
+    let hooks = Arc::new(hooks::HookRunner::new(
+        config.on_start.clone(),
+        config.on_stop.clone(),
+    ));
+    if hooks.is_configured() {
+        spawn_shutdown_hooks(Arc::clone(&hooks));
+    }
 
     loop {
         let server = loop {
@@ -106,6 +146,7 @@ async fn run() -> Result<()> {
         let status_handle = status.clone();
         let rediscover_rx_status = rediscover_rx.clone();
         let rediscover_tx_status = rediscover_tx.clone();
+        let hooks_status = Arc::clone(&hooks);
         tokio::spawn(async move {
             let mut runtime = runtime;
             let mut last_devices_hash = None;
@@ -124,6 +165,13 @@ async fn run() -> Result<()> {
                 match status_api.post_status(&bridge_id, &snapshot).await {
                     Ok(update) => {
                         failures = 0;
+                        // Desired state rides along on this poll; act on it before the config diff
+                        // so the source is switched on while the stream is being set up.
+                        if hooks_status.is_configured() {
+                            hooks_status
+                                .apply(update.source_active.unwrap_or(false))
+                                .await;
+                        }
                         if let Some(updated) = runtime.update(update) {
                             info!(
                                 "config update: assigned_input_id={:?}, capture_device={:?}, vad_threshold_db={}, vad_hold_ms={}, target_rate={}, resampler={}",
