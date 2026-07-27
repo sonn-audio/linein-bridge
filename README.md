@@ -95,28 +95,42 @@ Config fields:
 - `bridge_id` (auto-generated if missing)
 - `preferred_server_name` (optional; matches the advertised mDNS instance name, e.g. `Test Audioserver`)
 - `preferred_server_mac` (optional; matches the `mac` TXT record, any separator/case)
-- `on_start` (optional command, run when the input is selected)
-- `on_stop` (optional command, run when it is deselected)
+- `on_command` (optional script, run for every command the server sends)
 
-## Switching the source on (hooks)
+## Commands from the server (hook)
 
 The VAD only streams once there is audio, so a source that has to be switched on manually never
 starts by itself: nothing produces audio until it is on, and it is never turned on because nothing
-asked for it. The `on_start` / `on_stop` hooks close that loop.
+asked for it. The `on_command` hook closes that loop, and carries transport control too.
 
 ```toml
-on_start = "/home/rudy/code/scripts/power_on.sh"
-on_stop  = "/home/rudy/code/scripts/power_off.sh"
+on_command = "/home/rudy/code/scripts/ml-cmd.sh"
 ```
 
-The server reports desired state as `source_active` on the status poll, so a hook runs on a
-*change* only -- not on every poll. Selecting the input in any client (the app, a remote, a scene)
-runs `on_start`; deselecting it, switching the zone to another source, or turning the zone off runs
-`on_stop`. Stopping the service runs `on_stop` too, if the source was still active.
+The script is called as `<script> <command> [args...]`:
 
-Commands go through `sh -c`, so arguments are fine. A hook that fails is logged and ignored; it
-never takes the audio stream down. Because the poll interval is 5 seconds, expect up to that much
-delay between selecting the input and the hook running, plus however long the device itself needs.
+```sh
+#!/bin/sh
+case "$1" in
+  start) power_on ;;
+  stop)  power_off ;;
+  play|pause|next|previous) ml-send "$1" ;;
+esac
+```
+
+`start` and `stop` follow the server's selection: choosing this input in any client (the app, a
+remote, a scene) sends `start`, and deselecting it, switching the zone to another source, or turning
+the zone off sends `stop`. Stopping the service sends `stop` too, if the source was still active.
+Both are edge-triggered, so a repeated poll does not re-send them.
+
+`play`, `pause`, `next` and `previous` arrive when a client presses them while this input is the
+zone's active source. The server decides that -- it is the only thing that knows which source a zone
+is on -- so the bridge keeps no state of its own and simply forwards what it is told. Commands it has
+never heard of are passed through unchanged, so the server can add to the vocabulary without a bridge
+release.
+
+Commands ride along on the status poll, so expect up to 5 seconds of delay, plus however long the
+device itself needs. A hook that fails is logged and ignored; it never takes the audio stream down.
 
 ## Systemd unit
 

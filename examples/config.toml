@@ -2,8 +2,8 @@ bridge_id = "bridge-12345678-90ab-cdef-1234-567890abcdef"
 preferred_server_name = "sonn-core"
 preferred_server_mac = "aa:bb:cc:dd:ee:ff"
 
-# Run when the server reports this input has been selected / deselected. Use these to switch on
-# gear that does not power up by itself: without on_start the chain deadlocks, because the VAD only
-# streams once there is audio and there is no audio until the source is on.
-on_start = "/home/rudy/code/scripts/power_on.sh"
-on_stop = "/home/rudy/code/scripts/power_off.sh"
+# Run for every command the server sends, as `<script> <command> [args...]`: start, stop, play,
+# pause, next, previous. `start` is what switches on gear that does not power up by itself --
+# without it the chain deadlocks, because the VAD only streams once there is audio and there is no
+# audio until the source is on.
+on_command = "/home/rudy/code/scripts/ml-cmd.sh"
