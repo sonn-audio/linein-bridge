@@ -93,8 +93,8 @@ Example: `examples/config.toml`
 
 Config fields:
 - `bridge_id` (auto-generated if missing)
-- `preferred_server_name` (optional mDNS TXT match)
-- `preferred_server_mac` (optional mDNS TXT match)
+- `preferred_server_name` (optional; matches the advertised mDNS instance name, e.g. `Test Audioserver`)
+- `preferred_server_mac` (optional; matches the `mac` TXT record, any separator/case)
 - `on_start` (optional command, run when the input is selected)
 - `on_stop` (optional command, run when it is deselected)
 
