@@ -266,8 +266,18 @@ struct Resampler {
     rate_frames: u64,
     rate_start: Instant,
     last_rate_log: Instant,
+    rate_pending: Option<u32>,
+    rate_confirmations: u8,
     observed_rate: Arc<Mutex<Option<u32>>>,
 }
+
+/// How far the observed rate must sit from the rate we resample against before we believe the
+/// device really runs at a different rate. This is a ratio, so 0.005 = 0.5%: well above a sane
+/// card's error (~0.005%, i.e. 0.00005) and above this estimator's own noise, but still catches a
+/// device that is genuinely mis-declared (e.g. a 44.1 kHz card reported as 48 kHz).
+const RATE_DEADBAND_RATIO: f64 = 0.005;
+/// Consecutive agreeing windows required outside the deadband before re-rating the resampler.
+const RATE_CONFIRMATIONS: u8 = 3;
 
 impl Resampler {
     fn new(
@@ -301,6 +311,8 @@ impl Resampler {
             rate_frames: 0,
             rate_start: Instant::now(),
             last_rate_log: Instant::now(),
+            rate_pending: None,
+            rate_confirmations: 0,
             observed_rate,
         })
     }
@@ -337,35 +349,67 @@ impl Resampler {
             return;
         }
         let observed = (self.rate_frames as f64 / elapsed.as_secs_f64()).round() as u32;
+        self.rate_frames = 0;
+        self.rate_start = Instant::now();
         if observed == 0 {
             return;
-        }
-
-        if observed != self.in_rate {
-            info!(
-                "observed input rate: {} Hz (was {} Hz, target {} Hz, resampler={})",
-                observed,
-                self.in_rate,
-                self.target_rate,
-                self.mode.label()
-            );
-            self.in_rate = observed;
-            self.reset_resampler();
-            self.last_rate_log = Instant::now();
-        } else if self.last_rate_log.elapsed() >= Duration::from_secs(10) {
-            info!(
-                "observed input rate: {} Hz (target {} Hz, resampler={})",
-                observed,
-                self.target_rate,
-                self.mode.label()
-            );
-            self.last_rate_log = Instant::now();
         }
         if let Ok(mut slot) = self.observed_rate.lock() {
             *slot = Some(observed);
         }
-        self.rate_frames = 0;
-        self.rate_start = Instant::now();
+
+        // This counts frames handed to us by the capture callback over wall-clock time, so it
+        // measures OUR throughput, not the card's clock: whenever the TCP send or the VAD stalls,
+        // frames pile up in the driver buffer and the next batch reads as "faster than realtime".
+        // A real card is good to a few Hz (measured: 47997.67 Hz on an ALSA hardware counter,
+        // 0.005% off), which is far below this estimator's own noise floor. So treat it as
+        // telemetry and only re-rate the resampler when the device is off by more than
+        // RATE_DEADBAND_RATIO for RATE_CONFIRMATIONS consecutive windows -- resampling to a
+        // mismeasured rate invents samples, overflowing the very buffer it claims to fix.
+        let deviation = (observed as f64 - self.in_rate as f64).abs() / self.in_rate as f64;
+        if deviation <= RATE_DEADBAND_RATIO {
+            self.rate_pending = None;
+            if self.last_rate_log.elapsed() >= Duration::from_secs(10) {
+                info!(
+                    "observed input rate: {} Hz (using {} Hz, target {} Hz, resampler={})",
+                    observed,
+                    self.in_rate,
+                    self.target_rate,
+                    self.mode.label()
+                );
+                self.last_rate_log = Instant::now();
+            }
+            return;
+        }
+
+        // Outside the deadband: require consecutive windows to agree before believing it, so a
+        // single stall cannot re-rate the stream.
+        let agrees = self.rate_pending.is_some_and(|pending| {
+            (observed as f64 - pending as f64).abs() / pending as f64 <= RATE_DEADBAND_RATIO
+        });
+        if !agrees {
+            self.rate_pending = Some(observed);
+            self.rate_confirmations = 1;
+            return;
+        }
+        self.rate_confirmations = self.rate_confirmations.saturating_add(1);
+        if self.rate_confirmations < RATE_CONFIRMATIONS {
+            return;
+        }
+
+        info!(
+            "input rate changed: {} Hz (was {} Hz, {:.3}% off, target {} Hz, resampler={})",
+            observed,
+            self.in_rate,
+            deviation * 100.0,
+            self.target_rate,
+            self.mode.label()
+        );
+        self.in_rate = observed;
+        self.reset_resampler();
+        self.rate_pending = None;
+        self.rate_confirmations = 0;
+        self.last_rate_log = Instant::now();
     }
 
     fn reset_resampler(&mut self) {
