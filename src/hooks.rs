@@ -4,36 +4,40 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// Runs the configured on_start/on_stop scripts when the server selects or deselects this input.
+/// Hands commands from the server to a script on this machine.
 ///
-/// The server reports desired state (`source_active`) on every status poll, so this is
-/// edge-triggered: only a change runs a hook. That matters because the poll repeats every few
-/// seconds and the scripts drive real hardware -- re-running on_start each poll would keep
-/// re-powering a device that is already on.
+/// The bridge stays deliberately dumb: it holds no model of what the zone is doing and does not
+/// decide what a command means. The server knows which source a zone is on -- it is the only thing
+/// that does -- so it says "next" and the script decides how to put that on the wire for whatever
+/// hardware is attached here.
+///
+/// One hook rather than one per event: activation and deactivation are commands too, so `start` and
+/// `stop` go through the same script as `play` or `next`. Adding a command then costs a change to the
+/// script only, not to the bridge and its config.
 pub struct HookRunner {
-    on_start: Option<String>,
-    on_stop: Option<String>,
-    /// Last state we acted on. `None` until the server first tells us, so that a bridge which
-    /// starts up while the input is already deselected does not fire on_stop for a source it never
-    /// switched on.
+    on_command: Option<String>,
+    /// Last activation state we acted on. `None` until the server first reports, so a bridge that
+    /// starts up while its input is deselected does not send `stop` for a source it never started.
     state: Arc<Mutex<Option<bool>>>,
 }
 
 impl HookRunner {
-    pub fn new(on_start: Option<String>, on_stop: Option<String>) -> Self {
+    pub fn new(on_command: Option<String>) -> Self {
         Self {
-            on_start,
-            on_stop,
+            on_command,
             state: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn is_configured(&self) -> bool {
-        self.on_start.is_some() || self.on_stop.is_some()
+        self.on_command.is_some()
     }
 
-    /// Apply the server's desired state, running a hook only on a transition.
-    pub async fn apply(&self, active: bool) {
+    /// Apply the server's desired activation state, emitting `start`/`stop` only on a change.
+    ///
+    /// Edge-triggered because the status poll repeats every few seconds and these commands drive
+    /// real hardware: re-sending `start` on every poll would keep re-powering a device already on.
+    pub async fn apply_active(&self, active: bool) {
         let mut guard = self.state.lock().await;
         if *guard == Some(active) {
             return;
@@ -42,28 +46,25 @@ impl HookRunner {
         *guard = Some(active);
         drop(guard);
 
-        // Nothing to undo on the very first report of an inactive source.
         if first && !active {
-            debug!("source starts out inactive; no hook to run");
+            debug!("source starts out inactive; nothing to send");
             return;
         }
-
-        let script = if active {
-            self.on_start.as_deref()
-        } else {
-            self.on_stop.as_deref()
-        };
-        let label = if active { "on_start" } else { "on_stop" };
-        let Some(script) = script else {
-            debug!("source {} but no {} hook configured", active, label);
-            return;
-        };
-        info!("source {}; running {} hook", active, label);
-        run(label, script).await;
+        self.send(if active { "start" } else { "stop" }, &[]).await;
     }
 
-    /// Run the stop hook if the source is currently active. Used on shutdown so we do not leave
-    /// an amplifier switched on after the bridge goes away.
+    /// Forward a transport command. Passed through as-is: the server owns the vocabulary, so a
+    /// command this build has never heard of still reaches the script.
+    pub async fn command(&self, command: &str, args: &[String]) {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.send(trimmed, args).await;
+    }
+
+    /// Send `stop` if the source is currently active, so shutting the service down does not leave an
+    /// amplifier switched on.
     pub async fn shutdown(&self) {
         let mut guard = self.state.lock().await;
         if *guard != Some(true) {
@@ -71,20 +72,39 @@ impl HookRunner {
         }
         *guard = Some(false);
         drop(guard);
-        let Some(script) = self.on_stop.as_deref() else {
+        info!("shutting down with source active; sending stop");
+        self.send("stop", &[]).await;
+    }
+
+    async fn send(&self, command: &str, args: &[String]) {
+        let Some(script) = self.on_command.as_deref() else {
+            debug!("command {} dropped; no on_command hook configured", command);
             return;
         };
-        info!("shutting down with source active; running on_stop hook");
-        run("on_stop", script).await;
+        info!("running on_command hook: {} {}", command, args.join(" "));
+        run(script, command, args).await;
     }
 }
 
 /// Spawn via a shell so the config can hold a command with arguments, not just a bare path.
+///
+/// The command and its arguments are passed as the shell's positional parameters, so a configured
+/// script like `/path/ml-cmd.sh` receives them as "$@" the way any program would. The script text is
+/// left exactly as configured -- appending `"$@"` to it would double the arguments for any script
+/// that already refers to them, and silently change the meaning of a working hook.
+///
 /// Failures are logged and swallowed: a broken hook must not take the audio path down with it.
-async fn run(label: &str, script: &str) {
-    let spawned = Command::new("sh")
-        .arg("-c")
-        .arg(script)
+async fn run(script: &str, command: &str, args: &[String]) {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("exec {} \"$@\"", script))
+        // Placeholder for $0, which a `sh -c` script does not otherwise get.
+        .arg("linein-bridge")
+        .arg(command);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let spawned = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -93,19 +113,19 @@ async fn run(label: &str, script: &str) {
         .await;
     match spawned {
         Ok(output) if output.status.success() => {
-            debug!("{} hook finished", label);
+            debug!("on_command hook finished: {}", command);
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!(
-                "{} hook exited with {}: {}",
-                label,
+                "on_command hook for {} exited with {}: {}",
+                command,
                 output.status,
                 stderr.trim()
             );
         }
         Err(err) => {
-            warn!("{} hook failed to run: {}", label, err);
+            warn!("on_command hook for {} failed to run: {}", command, err);
         }
     }
 }
@@ -119,9 +139,19 @@ mod tests {
         std::env::temp_dir().join(format!("linein-hook-test-{}-{}", name, std::process::id()))
     }
 
-    /// Appends a line per invocation so the test can count how often a hook ran.
-    fn append_cmd(path: &Path, tag: &str) -> String {
-        format!("printf '{}\\n' >> {}", tag, path.display())
+    /// Writes a real script to disk and returns its path, so the tests exercise the same contract a
+    /// user's hook does: an executable that reads the command and arguments from "$@". A shell
+    /// one-liner would not -- a nested `sh -c` swallows the first parameter as its own $0.
+    fn record_cmd(marker: &Path) -> String {
+        let script = marker.with_extension("sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", marker.display()),
+        )
+        .expect("write hook script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod hook script");
+        script.display().to_string()
     }
 
     fn read(path: &Path) -> String {
@@ -129,68 +159,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_polls_run_the_hook_once_per_transition() {
+    async fn activation_sends_start_and_stop_once_per_transition() {
         let path = marker("edge");
         let _ = std::fs::remove_file(&path);
-        let hooks = HookRunner::new(
-            Some(append_cmd(&path, "start")),
-            Some(append_cmd(&path, "stop")),
-        );
+        let hooks = HookRunner::new(Some(record_cmd(&path)));
 
-        // The server repeats desired state on every poll; only changes may run a hook.
-        hooks.apply(true).await;
-        hooks.apply(true).await;
-        hooks.apply(true).await;
+        // The server repeats desired state on every poll; only a change may fire.
+        hooks.apply_active(true).await;
+        hooks.apply_active(true).await;
+        hooks.apply_active(true).await;
         assert_eq!(read(&path), "start\n");
 
-        hooks.apply(false).await;
-        hooks.apply(false).await;
+        hooks.apply_active(false).await;
+        hooks.apply_active(false).await;
         assert_eq!(read(&path), "start\nstop\n");
-
-        hooks.apply(true).await;
-        assert_eq!(read(&path), "start\nstop\nstart\n");
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
-    async fn starting_up_inactive_does_not_run_the_stop_hook() {
+    async fn starting_up_inactive_sends_nothing() {
         let path = marker("initial");
         let _ = std::fs::remove_file(&path);
-        let hooks = HookRunner::new(None, Some(append_cmd(&path, "stop")));
-        hooks.apply(false).await;
+        let hooks = HookRunner::new(Some(record_cmd(&path)));
+        hooks.apply_active(false).await;
         assert_eq!(
             read(&path),
             "",
-            "nothing was switched on, so nothing to switch off"
+            "nothing was started, so there is nothing to stop"
         );
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
-    async fn shutdown_runs_stop_only_while_active() {
-        let path = marker("shutdown");
+    async fn transport_commands_reach_the_script_with_arguments() {
+        let path = marker("cmd");
         let _ = std::fs::remove_file(&path);
-        let hooks = HookRunner::new(None, Some(append_cmd(&path, "stop")));
-        hooks.shutdown().await;
+        let hooks = HookRunner::new(Some(record_cmd(&path)));
+        hooks.command("play", &[]).await;
+        hooks.command("next", &[]).await;
+        hooks
+            .command("disc", &["3".to_string(), "7".to_string()])
+            .await;
+        // Unknown to this build: the server owns the vocabulary, so it must pass through untouched.
+        hooks
+            .command("sourcename", &["BeoSound 9000".to_string()])
+            .await;
         assert_eq!(
             read(&path),
-            "",
-            "never active: shutdown must not run the stop hook"
+            "play\nnext\ndisc 3 7\nsourcename BeoSound 9000\n"
         );
+        let _ = std::fs::remove_file(&path);
+    }
 
-        hooks.apply(true).await;
+    #[tokio::test]
+    async fn a_blank_command_is_ignored() {
+        let path = marker("blank");
+        let _ = std::fs::remove_file(&path);
+        let hooks = HookRunner::new(Some(record_cmd(&path)));
+        hooks.command("   ", &[]).await;
+        assert_eq!(read(&path), "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_stop_only_while_active() {
+        let path = marker("shutdown");
+        let _ = std::fs::remove_file(&path);
+        let hooks = HookRunner::new(Some(record_cmd(&path)));
         hooks.shutdown().await;
-        assert_eq!(read(&path), "stop\n");
+        assert_eq!(read(&path), "", "never active: shutdown must send nothing");
+
+        hooks.apply_active(true).await;
         hooks.shutdown().await;
-        assert_eq!(read(&path), "stop\n", "shutdown is idempotent");
+        assert_eq!(read(&path), "start\nstop\n");
+        hooks.shutdown().await;
+        assert_eq!(read(&path), "start\nstop\n", "shutdown is idempotent");
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn a_failing_hook_is_contained() {
-        let hooks = HookRunner::new(Some("exit 3".to_string()), None);
-        hooks.apply(true).await;
-        // Reaching here without panicking is the assertion: a broken hook must not take the
-        // audio path down with it.
+        let hooks = HookRunner::new(Some("exit 3".to_string()));
+        hooks.apply_active(true).await;
+        hooks.command("play", &[]).await;
+        // Reaching here without panicking is the assertion: a broken hook must not take the audio
+        // path down with it.
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_without_a_configured_hook() {
+        let hooks = HookRunner::new(None);
+        assert!(!hooks.is_configured());
+        hooks.apply_active(true).await;
+        hooks.command("play", &[]).await;
+        hooks.shutdown().await;
     }
 }

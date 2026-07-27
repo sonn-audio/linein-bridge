@@ -82,10 +82,7 @@ async fn run() -> Result<()> {
 
     // Shared across re-discovery so a server reconnect does not re-fire on_start for a source
     // that is already on.
-    let hooks = Arc::new(hooks::HookRunner::new(
-        config.on_start.clone(),
-        config.on_stop.clone(),
-    ));
+    let hooks = Arc::new(hooks::HookRunner::new(config.on_command.clone()));
     if hooks.is_configured() {
         spawn_shutdown_hooks(Arc::clone(&hooks));
     }
@@ -169,8 +166,13 @@ async fn run() -> Result<()> {
                         // so the source is switched on while the stream is being set up.
                         if hooks_status.is_configured() {
                             hooks_status
-                                .apply(update.source_active.unwrap_or(false))
+                                .apply_active(update.source_active.unwrap_or(false))
                                 .await;
+                            // Ordered after activation so a queued `play` cannot arrive before the
+                            // `start` that powers the device on.
+                            for queued in update.commands.iter().flatten() {
+                                hooks_status.command(&queued.command, &queued.args).await;
+                            }
                         }
                         if let Some(updated) = runtime.update(update) {
                             info!(

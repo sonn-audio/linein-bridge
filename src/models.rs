@@ -35,13 +35,24 @@ pub struct BridgeStatusRequest {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct SourceCommand {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct BridgeConfigResponse {
     pub assigned_input_id: Option<String>,
-    /// Whether the server currently wants this source on. Drives the on_start/on_stop hooks.
-    /// Absent on servers that predate the field, which reads as "not selected" and leaves hooks
+    /// Whether the server currently wants this source on. Drives the start/stop commands.
+    /// Absent on servers that predate the field, which reads as "not selected" and leaves the hook
     /// unused rather than firing spuriously.
     #[serde(default)]
     pub source_active: Option<bool>,
+    /// Transport commands queued since our last poll, oldest first. The server owns this vocabulary
+    /// and we pass each one to the hook untouched, so it can add commands without a bridge release.
+    #[serde(default)]
+    pub commands: Option<Vec<SourceCommand>>,
     pub ingest_ws_url: Option<String>,
     pub ingest_tcp_host: Option<String>,
     pub ingest_tcp_port: Option<u16>,
