@@ -1,3 +1,16 @@
+# [1.10.0](https://github.com/sonn-audio/linein-bridge/compare/v1.9.1...v1.10.0) (2026-07-27)
+
+
+### Bug Fixes
+
+* browse the sonncore mDNS service type ([b939e1b](https://github.com/sonn-audio/linein-bridge/commit/b939e1b73beeec91e0a89142213a76c1ea7dd539))
+* stop resampling against a mismeasured input rate ([930125e](https://github.com/sonn-audio/linein-bridge/commit/930125ef7b88572b12af0fdbcc59396faa253097))
+
+
+### Features
+
+* run on_start/on_stop hooks when the source is selected ([149af4f](https://github.com/sonn-audio/linein-bridge/commit/149af4f149dc70cac32d4461a8387f07c4d901b8))
+
 ## [1.9.1](https://github.com/lox-audioserver/lox-linein-bridge/compare/v1.9.0...v1.9.1) (2026-01-19)
 
 
